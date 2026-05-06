@@ -16,6 +16,10 @@ High
 
 [Challenge](https://ctftime.org/task/13503)
 
+[Official Challenge Site](https://archive.fluxfingers.net/2020/challenges/13.html)
+
+https://github.com/leesh3288/CTF/tree/master/2020/Hacklu_2020/LowFunHeap
+
 [Windows 10 ISO](https://archive.org/details/win-10-2004-english-x-64_20250829)
 
 [Low Fragmentation Heap](https://learn.microsoft.com/en-us/windows/win32/memory/low-fragmentation-heap)
