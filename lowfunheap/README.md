@@ -98,7 +98,23 @@ The dynamically allocated string buffer remains referenced by the OneObject obje
 - 
 ```
 struct ThreeObj {
-	/* 0x00 */ PVOID unknown;
-	/* 0x04 */ unknown;
+	/* 0x00 */ fourObj *array;
+	/* 0x04 */ INT arrayLen;
 }
+
+struct fourObj {
+	/* 0x00 */ char *field0;
+	/* 0x04 */ int unk4;
+	/* 0x08 */ int unk8;
+	/* 0x0c */ char *fieldC;
+} fourObj;
 ```
+
+| Object         | Allocated by      | Freed By     | Referenced By |
+| -------------- | ----------------- | ------------ | ------------- |
+| oneObj         | command '1'       | ?            | aPtrIndex     |
+| fourObj.field0 | recvToBuff (safe) | cleanup Loop | fourObj       |
+| fourObj.fieldC | recvToBuff (safe) | cleanup loop | fourObj       |
+- take 18 allocations to activate LFH
+- so we need at lesat 18 allocations of 0x20
+- then we should see the LFH active in Windbg
