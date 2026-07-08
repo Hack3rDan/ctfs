@@ -25,12 +25,20 @@ https://github.com/leesh3288/CTF/tree/master/2020/Hacklu_2020/LowFunHeap
 [Low Fragmentation Heap](https://learn.microsoft.com/en-us/windows/win32/memory/low-fragmentation-heap)
 
 [Black hat write up about LFH](https://www.illmatics.com/Understanding_the_LFH.pdf)
+(now saved locally at `references/Understanding_the_LFH.pdf` — this one *does* document the
+right heap manager for `lfh.exe` (classic NT Heap), unlike the Segment Heap paper below; see
+`docs/findings.md` "Classic NT Heap LFH internals" for what it explains about this exploit,
+including a full derivation of why `OOB_INDEX = -5` specifically)
 
 https://github.com/saaramar/Deterministic_LFH
 
 [Windows 8 Internals](https://media.blackhat.com/bh-us-12/Briefings/Valasek/BH_US_12_Valasek_Windows_8_Heap_Internals_Slides.pdf)
 
 [Windows 10 Segment Heap](https://blackhat.com/docs/us-16/materials/us-16-Yason-Windows-10-Segment-Heap-Internals.pdf)
+(now saved locally at `references/us-16-Yason-Windows-10-Segment-Heap-Internals-wp.pdf` —
+note this documents a *different* heap manager than the one `lfh.exe` actually uses; see
+`docs/findings.md` "Heap manager identity" for why classic NT Heap's LFH, not Segment Heap,
+applies here)
 
 ## Looking for something else
 
