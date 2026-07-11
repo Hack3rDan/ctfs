@@ -25,27 +25,18 @@ https://github.com/leesh3288/CTF/tree/master/2020/Hacklu_2020/LowFunHeap
 [Low Fragmentation Heap](https://learn.microsoft.com/en-us/windows/win32/memory/low-fragmentation-heap)
 
 [Black hat write up about LFH](https://www.illmatics.com/Understanding_the_LFH.pdf)
-(now saved locally at `references/Understanding_the_LFH.pdf` — this one *does* document the
-right heap manager for `lfh.exe` (classic NT Heap), unlike the Segment Heap paper below; see
-`docs/findings.md` "Classic NT Heap LFH internals" for what it explains about this exploit,
-including a full derivation of why `OOB_INDEX = -5` specifically)
 
 https://github.com/saaramar/Deterministic_LFH
 
 [Windows 8 Internals](https://media.blackhat.com/bh-us-12/Briefings/Valasek/BH_US_12_Valasek_Windows_8_Heap_Internals_Slides.pdf)
 
 [Windows 10 Segment Heap](https://blackhat.com/docs/us-16/materials/us-16-Yason-Windows-10-Segment-Heap-Internals.pdf)
-(now saved locally at `references/us-16-Yason-Windows-10-Segment-Heap-Internals-wp.pdf` —
-note this documents a *different* heap manager than the one `lfh.exe` actually uses; see
-`docs/findings.md` "Heap manager identity" for why classic NT Heap's LFH, not Segment Heap,
-applies here)
 
 ## Looking for something else
 
 Here's a list of "awesome windows ctfs"
 https://zaratec.io/awesome-windows-ctf/
-
-
+go 
 # Walkthrough
 
 1. Download/Create Windows VM
@@ -120,9 +111,81 @@ struct fourObj {
 
 | Object         | Allocated by      | Freed By     | Referenced By |
 | -------------- | ----------------- | ------------ | ------------- |
-| oneObj         | command '1'       | ?            | aPtrIndex     |
+| oneObj         | command '1'       | command '3' (see below) | aPtrIndex     |
 | fourObj.field0 | recvToBuff (safe) | cleanup Loop | fourObj       |
 | fourObj.fieldC | recvToBuff (safe) | cleanup loop | fourObj       |
 - take 18 allocations to activate LFH
 - so we need at lesat 18 allocations of 0x20
 - then we should see the LFH active in Windbg
+
+Turns out that "Freed By" question mark from before has an easy answer: every time the server sees a '3' byte, before it even looks at the new batch you're sending, it unconditionally frees everything from the *previous* '3' batch. So sending a '3' with a bogus element count (0xffff works nicely, it always fails validation) is a free way to say "free everything, allocate nothing." Handy.
+
+## Finding the bugs
+
+Okay, grooming primitive in hand, structs mapped out. Time to go find what's actually exploitable here.
+
+**Bug #1 lives in Command 1.** Remember `recvToBuff`, the helper that reads a line and allocates a buffer for it? I sent it a completely empty line — just `\n`, no data — and noticed the buffer-allocation step gets skipped entirely if the line is empty. So `OneObject.buffer` never gets written. It just sits there holding whatever garbage was already in that heap chunk. And since we just recycled a bunch of 0x20-byte chunks with our LFH-activation spray, that garbage is often *our own* leftover data.
+
+Even better: if that garbage happens to look like a non-null pointer, the server treats it as one — it does a `strlen()` and sends back whatever's at that address. That's a real arbitrary-read primitive, not just an echo of old bytes. (I don't end up needing this leak for the local exploit — more on that later — but it's a genuine bug and I did build a version of the exploit that uses it, just to prove it's real. See `docs/challenge-writeup.md` §5b if you're curious.)
+
+**Bug #2 lives in Command 3**, and it's the one that actually gets us code execution. The per-element index you send is only checked against the *upper* bound (`index < elem_cnt`). Nobody checks that it's not negative. Since indexing is just pointer math (`array_base + index * 0x10`), a negative index walks backward past the start of the array — into whatever heap chunk happens to be sitting right before it.
+
+## From OOB write to code execution
+
+So now I've got a write primitive that can land *before* my `fourObj` array. What's actually sitting there? If I've groomed things right, it's a live `OneObject` — and the very first field of `OneObject` is its vtable pointer.
+
+That's the whole trick: overwrite the vtable pointer with a pointer to a fake table I control, and get the server to call through it.
+
+Turns out the server does exactly that for free. After any Command 3 batch, it scans every element you just sent — if *any* of them has an empty or NULL `field0`/`fieldC`, it walks its whole list of live objects and calls three functions out of each one's vtable. Normally those three slots are boring do-nothing stubs. Not anymore.
+
+So one Command 3 call, two elements, does everything:
+- **Element 0** (a normal, in-bounds write): I stash my ROP chain here, and give it an empty `fieldC` so this same call also fires the trigger above.
+- **Element -5** (the OOB write): I stash an 8-byte fake vtable here. If this index lines up with a live `OneObject`, its vtable pointer gets replaced with a pointer to my fake table.
+
+Why `-5` specifically, and not `-1` or `-3`? Short version: the heap secretly pads every chunk with an 8-byte header we don't see in our own struct, so `-5` is the smallest index that lands on an actual chunk boundary instead of the middle of one. It's a fun little derivation — full math is in `docs/findings.md` ("Classic NT Heap LFH internals") if you want it.
+
+The other neat detail (only visible in the raw disassembly, not the decompiled pseudocode): right before the server calls through the hijacked vtable, it happens to load a CPU register (EBP) from that same element's `field0` value — which is exactly where I put my ROP chain. So the moment my fake vtable entry gets called, EBP is already pointing at my payload. That's what makes the stack pivot below work.
+
+## The payload: pivot, then ROP
+
+My fake vtable's one live entry is a `mov esp, ebp ; pop ebp ; ret` gadget from kernel32. Since EBP already points at my ROP chain (previous section), this one instruction moves the CPU's stack pointer into my buffer — and from there, every `ret` just walks through my chain.
+
+The chain itself does three things, in order:
+1. Reads the handle for `C:\flag.txt` (the server already has it open — it's sitting in a global variable).
+2. Calls `kernel32!ReadFile` on it, reading into some scratch space I picked out (a chunk of `.data` nothing else in the binary touches).
+3. Calls the binary's own "send 18 bytes" helper a few times to send the file contents back over the same socket.
+
+There's one genuinely fiddly bit: the chain needs to hand `ReadFile` the flag handle as an argument, but it doesn't know its own address ahead of time (it's sitting in a heap allocation, so its address depends on how the grooming went). So the chain computes its own address mid-flight (grab the current stack pointer, add a fixed offset) and patches the argument in, right before `ReadFile` reads it. Full gadget-by-gadget breakdown is in `docs/challenge-writeup.md` §6 if you want to see every slot.
+
+## Dealing with ASLR
+
+Both `lfh.exe` and `kernel32.dll` load at a randomized address every boot, and the ROP chain above needs real addresses for both. Since I'm running the target myself, I don't need a fancy in-protocol leak to figure out where they landed — I can just ask Windows directly (`CreateToolhelp32Snapshot` against the running process). Windows also only re-randomizes this once per boot, not per process launch, so I only have to ask once and it's good until the machine reboots.
+
+(For the record — I also built and validated the "real" version of this, the one you'd need against a genuinely remote target: groom the heap the same way, then use Bug #1's leak to blindly recover both addresses over the wire. It works, no OS access needed, just slower. `python exploit/solver.py --leak-bases` if you want to see it run. Details in `docs/challenge-writeup.md` §5b.)
+
+## Why it doesn't work every time
+
+Here's the thing about that `-5` index: it's guaranteed to land on *some* real chunk boundary. Whether that chunk happens to be a live `OneObject`, though, is not guaranteed — the heap deliberately randomizes which chunk ends up where within a bucket, specifically to make this exact kind of trick unreliable (this has been a Windows security hardening feature since Windows 8).
+
+So the exploit just retries: spin up a fresh connection, groom, fire, see if it worked. Empirically it lands about 1 time in 24, which in practice means a handful of seconds before it hits.
+
+## Running it
+
+```
+python exploit/solver.py
+```
+
+This spins up `lfh.exe` locally, connects, and starts trying. Most attempts fail loudly and immediately (the server just exits when the write misses) — that's expected, not a bug. Eventually:
+
+```
+[+] flag: b'flag{must_be_a_197_iq_hacker}'
+```
+
+## Further reading
+
+
+- `docs/challenge-writeup.md` — the full technical writeup, evidence-cited, organized by concept.
+- `docs/exploit-explained.md` — same story as above but with memory diagrams and a presentation-style Q&A.
+- `docs/solver-line-by-line.md` — every line of `exploit/solver.py` explained.
+- `docs/findings.md` — the fact-by-fact log, if you want to know exactly how confident we are about any given claim and why.
+- `docs/todo.md` — the couple of things I never fully nailed down (mainly: the exact algorithm Windows uses to pick which chunk goes where — I know *that* it's randomized and roughly when that hardening was added, just not the precise mechanism for this specific heap variant).
