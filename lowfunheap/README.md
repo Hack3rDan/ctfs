@@ -36,7 +36,7 @@ https://github.com/saaramar/Deterministic_LFH
 
 Here's a list of "awesome windows ctfs"
 https://zaratec.io/awesome-windows-ctf/
-go 
+
 # Walkthrough
 
 1. Download/Create Windows VM
@@ -167,7 +167,11 @@ Both `lfh.exe` and `kernel32.dll` load at a randomized address every boot, and t
 
 Here's the thing about that `-5` index: it's guaranteed to land on *some* real chunk boundary. Whether that chunk happens to be a live `OneObject`, though, is not guaranteed — the heap deliberately randomizes which chunk ends up where within a bucket, specifically to make this exact kind of trick unreliable (this has been a Windows security hardening feature since Windows 8).
 
-So the exploit just retries: spin up a fresh connection, groom, fire, see if it worked. Empirically it lands about 1 time in 24, which in practice means a handful of seconds before it hits.
+So the exploit retries: spin up a fresh connection, groom, fire, see if it worked. Originally that landed about 1 time in 24 — workable, but I figured we could do better. Turns out we could, easily: instead of grooming just one `OneObject` before firing, groom a bunch of them. More live targets means better odds that whichever chunk ends up 2 slots back is one of mine. Cranked it up and the hit rate climbed a lot — 22 objects gets us to about 90%.
+
+There's a hard ceiling on that trick, and I found it the fun way: one object past 22 and the hit rate doesn't degrade, it falls off a cliff to basically zero. Turns out the heap hands out chunks in fixed-size blocks (23 slots, for this particular size), and the 24th allocation gets kicked into a brand new, empty block — nowhere near any of my careful grooming. So 22 it is.
+
+I also tried firing several OOB writes at different offsets in one shot, hoping for more chances per attempt. Didn't work — turns out how many elements you send in that batch also controls the size of the array itself, so adding more probes knocks it clean out of the size class I need it in. Fun rabbit hole, didn't pan out, and 90% felt like a good place to stop.
 
 ## Running it
 
@@ -175,7 +179,7 @@ So the exploit just retries: spin up a fresh connection, groom, fire, see if it 
 python exploit/solver.py
 ```
 
-This spins up `lfh.exe` locally, connects, and starts trying. Most attempts fail loudly and immediately (the server just exits when the write misses) — that's expected, not a bug. Eventually:
+This spins up `lfh.exe` locally, connects, and starts trying. It usually lands on the first or second try these days; if you do see a failure, that's expected, not a bug — the server just exits when the write misses. Eventually:
 
 ```
 [+] flag: b'flag{must_be_a_197_iq_hacker}'
