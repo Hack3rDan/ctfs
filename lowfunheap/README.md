@@ -60,7 +60,7 @@ Triggered when a client sends a message that begins with '1'
 ![[Pasted image 20260506204037.png]]
 This section of code received 1 character from the socket, stores the result in a char variable (uVar1) and then tests to see if it is '1'.
 
-- Lateron, we can see that the server is expecting a string immediately following the '1':
+- Later on, we can see that the server is expecting a string immediately following the '1':
 ![[Pasted image 20260506204415.png]]
 After receiving the command byte `'1'`, the server expects additional client-controlled string data.
 There are no limits on the length as is described in the Heap Allocations section below
@@ -115,7 +115,7 @@ struct fourObj {
 | fourObj.field0 | recvToBuff (safe) | cleanup Loop | fourObj       |
 | fourObj.fieldC | recvToBuff (safe) | cleanup loop | fourObj       |
 - take 18 allocations to activate LFH
-- so we need at lesat 18 allocations of 0x20
+- so we need at least 18 allocations of 0x20
 - then we should see the LFH active in Windbg
 
 Turns out that "Freed By" question mark from before has an easy answer: every time the server sees a '3' byte, before it even looks at the new batch you're sending, it unconditionally frees everything from the *previous* '3' batch. So sending a '3' with a bogus element count (0xffff works nicely, it always fails validation) is a free way to say "free everything, allocate nothing." Handy.
