@@ -81,7 +81,7 @@ Finally, the buffer holding the client's string is stored as the last element of
 Command 1 allocates this struct:
 ```
 struct OneObject{
-	/* 0x00 */ int probable_vtable;
+	/* 0x00 */ int ptr_vtable;
 	/* 0x04 */ char unknown[24];
 	/* 0x1c */ char *buffer;
 }
@@ -92,6 +92,8 @@ This function uses a global index table variable that behaves like a ring buffer
 ![[Pasted image 20260506205508.png]]
 ![[Pasted image 20260506205614.png]]
 The dynamically allocated string buffer remains referenced by the OneObject object through the global index table.
+
+The exact use of this ring buffer was not fully understood during this exercise. This warrants further investigation
 # Command 3 Behavior
 - allocate 8 byte object (ThreeObj)
 - 
@@ -122,11 +124,9 @@ Turns out that "Freed By" question mark from before has an easy answer: every ti
 
 ## Finding the bugs
 
-Okay, grooming primitive in hand, structs mapped out. Time to go find what's actually exploitable here.
-
 **Bug #1 lives in Command 1.** Remember `recvToBuff`, the helper that reads a line and allocates a buffer for it? I sent it a completely empty line — just `\n`, no data — and noticed the buffer-allocation step gets skipped entirely if the line is empty. So `OneObject.buffer` never gets written. It just sits there holding whatever garbage was already in that heap chunk. And since we just recycled a bunch of 0x20-byte chunks with our LFH-activation spray, that garbage is often *our own* leftover data.
 
-Even better: if that garbage happens to look like a non-null pointer, the server treats it as one — it does a `strlen()` and sends back whatever's at that address. That's a real arbitrary-read primitive, not just an echo of old bytes. (I don't end up needing this leak for the local exploit — more on that later — but it's a genuine bug and I did build a version of the exploit that uses it, just to prove it's real. See `docs/challenge-writeup.md` §5b if you're curious.)
+Even better: if that garbage happens to look like a non-null pointer, the server treats it as one — it does a `strlen()` and sends back whatever's at that address. That's an arbitrary-read primitive, not just an echo of old bytes. I don't end up exercising this leak for the exploit -- more on that later.
 
 **Bug #2 lives in Command 3**, and it's the one that actually gets us code execution. The per-element index you send is only checked against the *upper* bound (`index < elem_cnt`). Nobody checks that it's not negative. Since indexing is just pointer math (`array_base + index * 0x10`), a negative index walks backward past the start of the array — into whatever heap chunk happens to be sitting right before it.
 
@@ -134,17 +134,17 @@ Even better: if that garbage happens to look like a non-null pointer, the server
 
 So now I've got a write primitive that can land *before* my `fourObj` array. What's actually sitting there? If I've groomed things right, it's a live `OneObject` — and the very first field of `OneObject` is its vtable pointer.
 
-That's the whole trick: overwrite the vtable pointer with a pointer to a fake table I control, and get the server to call through it.
+The plan; overwrite the vtable pointer with a pointer to a fake table I control, and get the server to call through it.
 
-Turns out the server does exactly that for free. After any Command 3 batch, it scans every element you just sent — if *any* of them has an empty or NULL `field0`/`fieldC`, it walks its whole list of live objects and calls three functions out of each one's vtable. Normally those three slots are boring do-nothing stubs. Not anymore.
+Turns out the server does exactly that. After any Command 3 batch, it scans every element you just sent — if *any* of them has an empty or NULL `field0`/`fieldC`, it walks its whole list of live objects and calls three functions out of each one's vtable.
 
 So one Command 3 call, two elements, does everything:
 - **Element 0** (a normal, in-bounds write): I stash my ROP chain here, and give it an empty `fieldC` so this same call also fires the trigger above.
 - **Element -5** (the OOB write): I stash an 8-byte fake vtable here. If this index lines up with a live `OneObject`, its vtable pointer gets replaced with a pointer to my fake table.
 
-Why `-5` specifically, and not `-1` or `-3`? Short version: the heap secretly pads every chunk with an 8-byte header we don't see in our own struct, so `-5` is the smallest index that lands on an actual chunk boundary instead of the middle of one. It's a fun little derivation — full math is in `docs/findings.md` ("Classic NT Heap LFH internals") if you want it.
+Why `-5` specifically, and not `-1` or `-3`? Short version: the heap secretly pads every chunk with an 8-byte header we don't see in our own struct, so `-5` is the smallest index that lands on an actual chunk boundary instead of the middle of one.
 
-The other neat detail (only visible in the raw disassembly, not the decompiled pseudocode): right before the server calls through the hijacked vtable, it happens to load a CPU register (EBP) from that same element's `field0` value — which is exactly where I put my ROP chain. So the moment my fake vtable entry gets called, EBP is already pointing at my payload. That's what makes the stack pivot below work.
+The other detail (only visible in the raw disassembly, not the decompiled pseudocode): right before the server calls through the hijacked vtable, it happens to load a CPU register (EBP) from that same element's `field0` value — which is exactly where I put my ROP chain. So the moment my fake vtable entry gets called, EBP is already pointing at my payload. That's what makes the stack pivot below work.
 
 ## The payload: pivot, then ROP
 
@@ -155,31 +155,28 @@ The chain itself does three things, in order:
 2. Calls `kernel32!ReadFile` on it, reading into some scratch space I picked out (a chunk of `.data` nothing else in the binary touches).
 3. Calls the binary's own "send 18 bytes" helper a few times to send the file contents back over the same socket.
 
-There's one genuinely fiddly bit: the chain needs to hand `ReadFile` the flag handle as an argument, but it doesn't know its own address ahead of time (it's sitting in a heap allocation, so its address depends on how the grooming went). So the chain computes its own address mid-flight (grab the current stack pointer, add a fixed offset) and patches the argument in, right before `ReadFile` reads it. Full gadget-by-gadget breakdown is in `docs/challenge-writeup.md` §6 if you want to see every slot.
+There's one other note: the chain needs to hand `ReadFile` the flag handle as an argument, but it doesn't know its own address ahead of time (it's sitting in a heap allocation, so its address depends on how the grooming went). So the chain computes its own address mid-flight (grab the current stack pointer, add a fixed offset) and patches the argument in, right before `ReadFile` reads it.
 
 ## Dealing with ASLR
 
-Both `lfh.exe` and `kernel32.dll` load at a randomized address every boot, and the ROP chain above needs real addresses for both. Since I'm running the target myself, I don't need a fancy in-protocol leak to figure out where they landed — I can just ask Windows directly (`CreateToolhelp32Snapshot` against the running process). Windows also only re-randomizes this once per boot, not per process launch, so I only have to ask once and it's good until the machine reboots.
+Both `lfh.exe` and `kernel32.dll` load at a randomized address every boot, and the ROP chain above needs real addresses for both. Since I'm running the target myself, I don't need a leak to figure out where they landed — load the binary in WinDbg by attaching to the running process to determine base address. Windows also only re-randomizes this once per boot, not per process launch, so I only have to ask once and it's good until the machine reboots.
 
-(For the record — I also built and validated the "real" version of this, the one you'd need against a genuinely remote target: groom the heap the same way, then use Bug #1's leak to blindly recover both addresses over the wire. It works, no OS access needed, just slower. `python exploit/solver.py --leak-bases` if you want to see it run. Details in `docs/challenge-writeup.md` §5b.)
+I did implement determining the base address by utilizing the leak to demonstrate how this is done, but this is a brute force and isn't
 
 ## Why it doesn't work every time
 
 Here's the thing about that `-5` index: it's guaranteed to land on *some* real chunk boundary. Whether that chunk happens to be a live `OneObject`, though, is not guaranteed — the heap deliberately randomizes which chunk ends up where within a bucket, specifically to make this exact kind of trick unreliable (this has been a Windows security hardening feature since Windows 8).
 
-So the exploit retries: spin up a fresh connection, groom, fire, see if it worked. Originally that landed about 1 time in 24 — workable, but I figured we could do better. Turns out we could, easily: instead of grooming just one `OneObject` before firing, groom a bunch of them. More live targets means better odds that whichever chunk ends up 2 slots back is one of mine. Cranked it up and the hit rate climbed a lot — 22 objects gets us to about 90%.
+So the exploit retries: spin up a fresh connection, groom, fire, see if it worked. Originally that landed about 1 time in 24 — workable, but I figured we could do better. Turns out we could, easily: instead of grooming just one `OneObject` before firing, groom a bunch of them. More live targets means better odds that whichever chunk ends up 2 slots back is one of mine. After testing — 22 objects gets us to about 90%.
 
-There's a hard ceiling on that trick, and I found it the fun way: one object past 22 and the hit rate doesn't degrade, it falls off a cliff to basically zero. Turns out the heap hands out chunks in fixed-size blocks (23 slots, for this particular size), and the 24th allocation gets kicked into a brand new, empty block — nowhere near any of my careful grooming. So 22 it is.
-
-I also tried firing several OOB writes at different offsets in one shot, hoping for more chances per attempt. Didn't work — turns out how many elements you send in that batch also controls the size of the array itself, so adding more probes knocks it clean out of the size class I need it in. Fun rabbit hole, didn't pan out, and 90% felt like a good place to stop.
-
+Going over 22 objects makes the odds of hitting drop to near zero. Apparently in this particular bucket only 22 objects can be allocated, anymore and a new bucket is used.
 ## Running it
 
 ```
 python exploit/solver.py
 ```
 
-This spins up `lfh.exe` locally, connects, and starts trying. It usually lands on the first or second try these days; if you do see a failure, that's expected, not a bug — the server just exits when the write misses. Eventually:
+This spins up `lfh.exe` locally, connects, and starts trying. It usually lands on the first or second try; if you do see a failure, that's expected, not a bug — the server just exits when the write misses. Eventually:
 
 ```
 [+] flag: b'flag{must_be_a_197_iq_hacker}'
